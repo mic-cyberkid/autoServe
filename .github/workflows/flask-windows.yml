@@ -1,15 +1,11 @@
-# .github/workflows/flask-windows-debug.yml
-name: Flask – Windows (debug)
+# .github/workflows/flask-windows.yml
+name: Flask – Windows CI
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
+on: [push, pull_request]
 
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 15
     defaults:
       run:
         shell: pwsh
@@ -29,63 +25,64 @@ jobs:
           pip install -r requirements.txt
 
       # -------------------------------------------------
-      # 1. Start Flask with explicit CWD + live tail
+      # 1. Start Flask in background (with CWD fix)
       # -------------------------------------------------
-      - name: Start Flask (background job)
+      - name: Start Flask server
         run: |
           $log = "$env:RUNNER_TEMP\flask.log"
-          $repo = $PWD.Path   # <-- important: absolute repo root
+          $repo = $PWD.Path
 
           Start-Job -Name Flask -ScriptBlock {
             Set-Location $using:repo
             python "$using:repo\app.py" > $using:log 2>&1
           } | Out-Null
 
-          Write-Host "Flask job started. Log: $log"
-          # Show first few lines immediately
-          Start-Sleep -Seconds 1
-          Get-Content $log -Tail 5 -ErrorAction SilentlyContinue
+          Write-Host "Flask started. Waiting for port 5000..."
 
       # -------------------------------------------------
-      # 2. **Live tail** of server log while waiting
+      # 2. Wait for TCP port 5000 to be LISTENING
       # -------------------------------------------------
-      - name: Tail server log (live)
+      - name: Wait for port 5000 (TCP)
         run: |
-          $log = "$env:RUNNER_TEMP\flask.log"
-          $tail = Start-Job -ScriptBlock {
-            $path = $using:log
-            while ($true) {
-              Get-Content $path -Tail 1 -Wait -ErrorAction SilentlyContinue
-            }
-          }
-
-      # -------------------------------------------------
-      # 3. Wait for /health – with **debug output**
-      # -------------------------------------------------
-      - name: Wait for server (max 60 s)
-        run: |
-          $url = "http://127.0.0.1:5000/health"
-          $max = 60
-          $i   = 0
-
-          while ($i -lt $max) {
-            try {
-              $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3 -Method Get
-              if ($resp.StatusCode -eq 200) {
-                Write-Host "Server READY after $($i)s"
-                break
-              }
-            }
-            catch {
-              Write-Host "Attempt $($i+1)/$max – $_"
+          $timeout = 60
+          $elapsed = 0
+          while ($elapsed -lt $timeout) {
+            $connection = Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue
+            if ($connection) {
+              Write-Host "Port 5000 is LISTENING"
+              break
             }
             Start-Sleep -Seconds 1
-            $i++
+            $elapsed++
+          }
+          if ($elapsed -ge $timeout) {
+            Write-Error "Port 5000 never opened"
+            Get-Content "$env:RUNNER_TEMP\flask.log"
+            exit 1
           }
 
-          if ($i -eq $max) {
-            Write-Error "Server never became healthy"
-            Get-Content "$env:RUNNER_TEMP\flask.log" | Select-Object -Last 50
+      # -------------------------------------------------
+      # 3. Wait for HTTP /health to return 200
+      # -------------------------------------------------
+      - name: Wait for /health endpoint
+        run: |
+          $url = "http://127.0.0.1:5000/health"
+          $timeout = 30
+          $elapsed = 0
+          while ($elapsed -lt $timeout) {
+            try {
+              $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -eq 200) {
+                Write-Host "Server is healthy!"
+                break
+              }
+            } catch { }
+            Start-Sleep -Seconds 1
+            $elapsed++
+          }
+          if ($elapsed -ge $timeout) {
+            Write-Error "Server did not respond to /health"
+            Get-Content "$env:RUNNER_TEMP\flask.log"
             exit 1
           }
 
@@ -96,16 +93,13 @@ jobs:
         run: python client_test.py
 
       # -------------------------------------------------
-      # 5. Always show full log + stop job
+      # 5. Cleanup
       # -------------------------------------------------
-      - name: Show full server log
-        if: always()
-        run: |
-          Write-Host "=== FULL FLASK LOG ==="
-          Get-Content "$env:RUNNER_TEMP\flask.log" -ErrorAction SilentlyContinue
+      - name: Show logs (on failure)
+        if: failure()
+        run: Get-Content "$env:RUNNER_TEMP\flask.log"
 
-      - name: Stop Flask job
+      - name: Stop Flask
         if: always()
         run: |
           Get-Job -Name Flask | Stop-Job -PassThru | Remove-Job
-          Get-Job | Where-Object Name -like '*tail*' | Stop-Job -PassThru | Remove-Job
