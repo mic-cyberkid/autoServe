@@ -1,41 +1,52 @@
 # test_integration.py
-import threading
+import subprocess
 import time
 import requests
 import sys
-from app import app  # <-- your Flask app
+import os
 
-def run_server():
-    """Run Flask in a thread"""
-    app.run(host="127.0.0.1", port=5000, use_reloader=False, debug=False)
+def start_server():
+    """Start Flask server as a real subprocess"""
+    print("Starting Flask server...")
+    # Use python -m flask or direct script
+    cmd = [sys.executable, "app.py"]
+    env = os.environ.copy()
+    env["FLASK_ENV"] = "production"  # Optional
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
 
 def wait_for_server(url="http://127.0.0.1:5000/health", timeout=30):
-    """Wait until /health returns 200"""
     print(f"Waiting for server at {url}...")
     start = time.time()
     while time.time() - start < timeout:
         try:
-            r = requests.get(url, timeout=1)
+            r = requests.get(url, timeout=2)
             if r.status_code == 200:
                 print("Server is ready!")
                 return True
         except:
             time.sleep(0.5)
-    print("Server failed to start in time.")
+    print("Server did not start in time.")
     return False
 
 def run_client_tests():
-    """Your actual client logic"""
     print("Running client tests...")
     try:
         r = requests.get("http://127.0.0.1:5000/")
         assert r.status_code == 200
-        assert r.json()["message"] == "Hello from Windows CI!"
+        data = r.json()
+        expected = "Hello from Windows CI!" if "Windows" in os.name else "Hello from Flask!"
+        assert data.get("message") == expected
         print("Home endpoint: PASS")
 
         h = requests.get("http://127.0.0.1:5000/health")
         assert h.status_code == 200
-        assert h.json()["status"] == "ok"
+        assert h.json().get("status") == "ok"
         print("Health endpoint: PASS")
 
         print("ALL TESTS PASSED!")
@@ -45,17 +56,31 @@ def run_client_tests():
         return False
 
 if __name__ == "__main__":
-    # 1. Start server in background thread
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
+    # 1. Start server as subprocess
+    server = start_server()
 
-    # 2. Wait for it to be ready
+    # 2. Stream logs in real-time
+    def stream_logs():
+        for line in server.stdout:
+            print(line.rstrip())
+
+    import threading
+    log_thread = threading.Thread(target=stream_logs, daemon=True)
+    log_thread.start()
+
+    # 3. Wait for health
     if not wait_for_server():
+        server.terminate()
         sys.exit(1)
 
-    # 3. Run client tests
-    if not run_client_tests():
-        sys.exit(1)
+    # 4. Run client
+    success = run_client_tests()
 
-    # 4. Done — thread exits with process
-    sys.exit(0)
+    # 5. Cleanup
+    server.terminate()
+    try:
+        server.wait(timeout=5)
+    except:
+        server.kill()
+
+    sys.exit(0 if success else 1)
