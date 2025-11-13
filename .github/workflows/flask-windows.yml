@@ -25,25 +25,28 @@ jobs:
           pip install -r requirements.txt
 
       # -------------------------------------------------
-      # 1. Start Flask — PASS VARIABLES CORRECTLY
+      # 1. Start Flask — USING FULL PYTHON PATH
       # -------------------------------------------------
       - name: Start Flask server
         run: |
-          $logPath = "$env:RUNNER_TEMP\flask.log"
-          $repoPath = $PWD.Path
+          $python = (Get-Command python).Path
+          $log = "$env:RUNNER_TEMP\flask.log"
+          $repo = $PWD.Path
 
-          # CRITICAL: Pass variables via -ArgumentList
-          Start-Job -Name Flask -ArgumentList $repoPath,$logPath -ScriptBlock {
-            param($repo, $log)
-            Set-Location $repo
-            python "$repo\app.py" > $log 2>&1
+          Write-Host "Using Python: $python"
+          Write-Host "Log file: $log"
+          Write-Host "Repo: $repo"
+
+          Start-Job -Name Flask -ArgumentList $python,$repo,$log -ScriptBlock {
+            param($py, $dir, $logFile)
+            Set-Location $dir
+            & $py "$dir\app.py" > $logFile 2>&1
           } | Out-Null
 
-          Write-Host "Flask job started. Log: $logPath"
-          Write-Host "Repo path: $repoPath"
+          Write-Host "Flask job started (PID: $((Get-Job -Name Flask).Id))"
 
       # -------------------------------------------------
-      # 2. Wait for port 5000 to be LISTENING (TCP level)
+      # 2. Wait for port 5000
       # -------------------------------------------------
       - name: Wait for port 5000
         run: |
@@ -51,20 +54,20 @@ jobs:
           for ($i = 0; $i -lt $max; $i++) {
             $conn = Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue
             if ($conn) {
-              Write-Host "Port 5000 is OPEN after $($i)s"
+              Write-Host "Port 5000 LISTENING after $($i)s"
               break
-            }
-            if ($i -eq ($max-1)) {
-              Write-Error "Port 5000 never opened!"
-              Get-Job -Name Flask | Receive-Job
-              Get-Content "$env:RUNNER_TEMP\flask.log" -ErrorAction SilentlyContinue
-              exit 1
             }
             Start-Sleep -Seconds 1
           }
+          if (!$conn) {
+            Write-Error "Port 5000 never opened"
+            Get-Content "$env:RUNNER_TEMP\flask.log" -ErrorAction SilentlyContinue
+            Get-Job -Name Flask | Receive-Job
+            exit 1
+          }
 
       # -------------------------------------------------
-      # 3. Wait for HTTP /health
+      # 3. Wait for /health
       # -------------------------------------------------
       - name: Wait for /health
         run: |
@@ -73,17 +76,11 @@ jobs:
           for ($i = 0; $i -lt $max; $i++) {
             try {
               $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) {
-                Write-Host "/health OK"
-                break
-              }
-            } catch {}
-            if ($i -eq ($max-1)) {
-              Write-Error "Health check failed"
-              exit 1
-            }
+              if ($r.StatusCode -eq 200) { Write-Host "Server healthy"; break }
+            } catch { Write-Host "Still waiting... ($i)" }
             Start-Sleep -Seconds 1
           }
+          if ($i -ge $max) { Write-Error "Health check failed"; exit 1 }
 
       # -------------------------------------------------
       # 4. Run client
@@ -92,15 +89,13 @@ jobs:
         run: python client_test.py
 
       # -------------------------------------------------
-      # 5. Always show logs + cleanup
+      # 5. Always show logs
       # -------------------------------------------------
-      - name: Show Flask output
+      - name: Show Flask log
         if: always()
         run: |
           Write-Host "=== FLASK LOG ==="
           Get-Content "$env:RUNNER_TEMP\flask.log" -ErrorAction SilentlyContinue
-          Write-Host "=== JOB OUTPUT ==="
-          Get-Job -Name Flask | Receive-Job
 
       - name: Stop Flask job
         if: always()
